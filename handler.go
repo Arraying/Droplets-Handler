@@ -1,11 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
-	"runtime"
-	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -13,112 +14,109 @@ import (
 type (
 	// Config represents the main config file.
 	Config struct {
-		Redis struct {
-			Host     string `json:"host"`
-			Port     int    `json:"port"`
-			Auth     string `json:"auth"`
-			Database int    `json:"database"`
-		} `json:"redis"`
-		TemplatesDir string `json:"templates-dir"`
-		TargetDir    string `json:"target-dir"`
-		Token        string `json:"token"`
+		Redis      ConfigRedis   `json:"redis"`    // The Redis credentials.
+		Timings    ConfigTimings `json:"timings"`  // The timings.
+		ExternalIP string        `json:"external"` // The external IP of the node. Leave blank if the proxy is also on the same node.
+		Token      string        `json:"token"`    // The token, an internal password for Droplets.
 	}
-)
-
-const (
-	configFile   = "config.json"
-	templateFile = "template.json"
-	lockFile     = "droplets.lock"
+	// ConfigRedis represents the Redis database credentials and information.
+	ConfigRedis struct {
+		Host string // The host, including port.
+		Auth string // The auth string.
+	}
+	// ConfigTimings represents the timings configuration.
+	ConfigTimings struct {
+		Identify int `json:"identify"` // The time, in seconds, to wait for identifies.
+		Destroy  int `json:"destroy"`  // The time, in seconds, before the Droplet will be removed after the destroy payload.
+		Notify   int `json:"notify"`   // The interval, in seconds, at which the notification should occur.
+	}
 )
 
 var (
 	config    Config
-	templates = make([]*Template, 0)
+	templates []Template
+	conns     connections
+	store     = garage{
+		make(map[string]*droplet),
+		sync.RWMutex{},
+	}
+	iidIncrement uint64
 )
 
-// main is the entry point of the program.
+// Main is the entry point of the program.
 func main() {
-	log.Println("Checking OS compatibility...")
-	if runtime.GOOS != "linux" {
-		log.Println("Droplets unable to run on non-linux operating systems.")
+	log.SetPrefix("Droplets-Handler ")
+	if !lockGet() {
+		log.Println("Cannot get lock. Is another instance running?")
 		return
 	}
-	log.Println("Operating system compatible. #LinuxMasterrace.")
-	if !initiateLock() {
-		log.Println("Droplet lock already exists, perhaps another handler is running?")
-		return
-	}
-	log.Println("Loading configuration...")
-	err := loadData(configFile, &config)
+	log.Println("Loading config.json.")
+	bites, err := ioutil.ReadFile("config.json")
 	if err != nil {
+		log.Println("Could not read config.json, does it exist?")
 		panic(err)
 	}
-	if !config.isValid() {
-		log.Println("Configuration is invalid.")
-		return
-	}
-	config.handleDirs()
-	log.Println("Loaded configuration.")
-	log.Println("Loading templates...")
-	var localTemplates []*Template
-	err = loadData(templateFile, &localTemplates)
+	err = json.Unmarshal(bites, &config)
 	if err != nil {
+		log.Println("Could not load config.json, is it a valid JSON object?")
 		panic(err)
 	}
-	for _, template := range localTemplates {
-		if template.isValid() {
-			if template.containsFiles() {
-				log.Printf("Registered template %s.\n", template.Name)
-				templates = append(templates, template)
-			} else {
-				log.Printf("Template %s does not contain all required files.\n", template.Name)
-			}
-		} else {
-			log.Printf("Template %s is invalid.\n", template.Name)
-		}
-	}
-	log.Println("Template loading completed.")
-	log.Println("Connecting to Redis...")
-	err = connectRedis()
+	log.Println("Loading templates.json.")
+	bites, err = ioutil.ReadFile("templates.json")
 	if err != nil {
+		log.Println("Could not read templates.json, does it exist?")
 		panic(err)
 	}
-	go payloadReceive()
+	err = json.Unmarshal(bites, &templates)
+	if err != nil {
+		log.Println("Could not load templates.json, is it a valid JSON array?")
+		panic(err)
+	}
+	log.Println("Connecting to Redis.")
+	redisConnect()
+	go redisPayloadListen()
 	go func() {
+		notify := 60
+		if config.Timings.Notify > 0 {
+			notify = config.Timings.Notify
+		}
 		for {
-			time.Sleep(1 * time.Minute)
-			droplets.forAllDroplets(func(droplet *droplet) {
-				log.Printf("Reported registered droplet %s (identified: %t).\n", droplet.identifier, droplet.identified)
+			time.Sleep(time.Duration(notify) * time.Second)
+			log.Println("-- BEGIN REPORT --")
+			store.forEach(func(droplet *droplet) {
+				log.Printf("* %s (identified: %t)\n", droplet.identifier, droplet.identified)
 			})
+			log.Println("-- END REPORT --")
 		}
 	}()
 	keepalive := make(chan os.Signal, 1)
 	signal.Notify(keepalive, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
 	<-keepalive
-	terminate()
-}
-
-// isValid checks the validity of a config.
-func (c *Config) isValid() bool {
-	return c.Redis.Host != "" && c.Redis.Port != 0 && c.TemplatesDir != "" && c.TargetDir != "" && c.Token != ""
-}
-
-// handleDirs appends the directory separator to path variables.
-func (c *Config) handleDirs() {
-	c.TemplatesDir = appendSlash(c.TemplatesDir)
-	c.TargetDir = appendSlash(c.TargetDir)
-}
-
-// toRedisString creates a Redis connection string.
-func (c *Config) toRedisString() string {
-	return c.Redis.Host + ":" + strconv.Itoa(c.Redis.Port)
-}
-
-// terminate terminates everything.
-func terminate() {
-	droplets.forAllDroplets(func(droplet *droplet) {
-		droplet.delete(true)
+	store.forEach(func(droplet *droplet) {
+		droplet.destroy(true)
 	})
-	conns.close()
-	removeLock()
+	redisDisconnect()
+	lockRemove()
+	log.Println("Goodbye.")
+}
+
+// lockGet attempts to get a lock for the current Droplet handler.
+// That way, multiple handlers cannot run with the same files.
+// Returns true if the lock was established, false if there is already a lock.
+func lockGet() bool {
+	if ioFileExists("droplets.lock") {
+		return false
+	}
+	_, err := os.Create("droplets.lock")
+	if err != nil {
+		panic(err)
+	}
+	return true
+}
+
+// lockRemove cleans up the lock after it is no longer needed.
+func lockRemove() {
+	if err := os.Remove("droplets.lock"); err != nil {
+		panic(err)
+	}
 }

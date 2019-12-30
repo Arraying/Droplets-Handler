@@ -1,193 +1,183 @@
 package main
 
 import (
-	"bytes"
-	"errors"
-	"io/ioutil"
+	"fmt"
 	"log"
-	"os"
-	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type (
-	// Template represents a droplet template.
+	// Template represents a Droplet template.
+	// Templates are to Droplets what classes are to Objects.
 	Template struct {
-		Name      string `json:"name"`
-		MinMemory int    `json:"min-memory"`
-		MaxMemory int    `json:"max-memory"`
+		Name        string   `json:"name"`            // The template name.
+		Image       string   `json:"image"`           // The Docker image name.
+		RestrictCPU int      `json:"cpu-restriction"` // The CPU restriction on the container.
+		RestrictRAM string   `json:"ram-restriction"` // The RAM restriction on the container.
+		Networks    []string `json:"networks"`        // A list of networks to connect the container to.
+		Mounts      []struct {
+			From string `json:"from"` // The location on the host.
+			To   string `json:"to"`   // The location on the container.
+		} `json:"mounts"` // A list of mounts to mount on the container.
+		Flags string `json:"flags"` // Any additional flags.
 	}
-	dropletMap struct {
-		droplets map[string]*droplet
-		mutex    sync.Mutex
-	}
+	// droplet is a droplet instance.
 	droplet struct {
-		identifier string
-		ip         string
-		port       int
-		data       string
-		template   *Template
-		identified bool
-		iid        uint64
+		identifier string    // The unique identifier for the Droplet. This can be re-assigned in the lifetime of the handler.
+		iid        uint64    // The unique internal identifier for the Droplet. This cannot be re-assigned in the lifetime of the handler.
+		template   *Template // The template used for this Droplet.
+		identified bool      // Whether or not the container has identified to the handler.
+		ip         string    // The IP.
+		port       int       // The port.
+		data       string    // The data that was specified during the creation.
 	}
-	dropletFile struct {
-		name       string
-		required   bool
-		handler    func(string, ...interface{})
-		handlerUID int
+	// garage acts as a central storage location for all Droplets.
+	// It contains the data required to make the map work.
+	garage struct {
+		droplets map[string]*droplet // A map of Droplet identifier to the actual Droplet.
+		lock     sync.RWMutex        // A lock such that concurrency is safely possible. Wear protection, kids.
 	}
 )
 
-const (
-	pluginName       = "Droplets"
-	statusOnline     = "online"
-	statusOffline    = "offline"
-	handlerUIDBoot   = 1
-	handlerUIDLogs   = 2
-	handlerUIDConfig = 3
-	handlerUIDServer = 4
-	filePlugins      = "plugins/"
-	fileSpigot       = "spigot.jar"
-)
-
-var (
-	droplets = dropletMap{
-		droplets: make(map[string]*droplet),
+// construct constructs a Droplet from the current template.
+func (template *Template) construct(data string) (instance *droplet, err error) {
+	identifier := dropletGenerateIdentifier(template.Name)
+	port, err := ioFreePort()
+	if err != nil {
+		log.Println("Error obtaining free port.")
+		return
 	}
-	internalDropletHandlerID uint64
-	requiredFiles            = []dropletFile{
-		dropletFile{
-			name:     "boot.sh",
-			required: true,
-			handler: func(path string, args ...interface{}) {
-				if len(args) < 2 {
-					log.Println("Expected 2 arguments, found none.")
-					return
-				}
-				identifier := args[0].(string)
-				data := args[1].(string)
-				template := args[2].(*Template)
-				bytes, err := ioutil.ReadFile(path)
-				if err != nil {
-					log.Printf("Could not edit file %s: %s.\n", path, err.Error())
-					return
-				}
-				str := string(bytes)
-				variables := []bootVariable{
-					bootVariable{
-						placeholder: "IDENTIFIER",
-						value:       identifier,
-					},
-					bootVariable{
-						placeholder: "MEMORY_MAX",
-						value:       strconv.Itoa(template.MaxMemory),
-					},
-					bootVariable{
-						placeholder: "MEMORY_MIN",
-						value:       strconv.Itoa(template.MinMemory),
-					},
-					bootVariable{
-						placeholder: "SPIGOT",
-						value:       targetPath(identifier, fileSpigot),
-					},
-					bootVariable{
-						placeholder: "DATA",
-						value:       data,
-					},
-				}
-				str = replaceAll(str, variables...)
-				log.Printf("Modified boot script: %s.\n", str)
-				err = ioutil.WriteFile(path, []byte(str), 0644)
-				if err != nil {
-					log.Printf("Could not save file %s: %s.\n", path, err.Error())
-				}
-			},
-			handlerUID: handlerUIDBoot,
-		},
-		dropletFile{
-			name:     "logs/",
-			required: false,
-			handler: func(path string, args ...interface{}) {
-				err := os.RemoveAll(path)
-				if err != nil {
-					log.Printf("Could not delete %s directory: %s.\n", path, err.Error())
-				}
-			},
-			handlerUID: handlerUIDLogs,
-		},
-		dropletFile{
-			name:     filePlugins + pluginName + ".jar",
-			required: true,
-		},
-		dropletFile{
-			name:     filePlugins + pluginName + "/",
-			required: true,
-		},
-		dropletFile{
-			name:     filePlugins + pluginName + "/config.json",
-			required: true,
-			handler: func(path string, args ...interface{}) {
-				identifier := args[0].(string)
-				data := args[1].(string)
-				var dataMap map[string]interface{}
-				err := loadData(path, &dataMap)
-				if err != nil {
-					log.Printf("Could not load config %s.\n", path)
-					return
-				}
-				dataMap["identifier"] = identifier
-				if data != "" {
-					dataMap["data"] = data
-				}
-				err = saveData(path, &dataMap)
-				if err != nil {
-					log.Printf("Could not save config %s.\n", path)
-				}
-			},
-			handlerUID: handlerUIDConfig,
-		},
-		dropletFile{
-			name:     "server.properties",
-			required: true,
-			handler: func(path string, args ...interface{}) {
-				ip := args[0].(string)
-				port := args[1].(int)
-				contents, err := ioutil.ReadFile(path)
-				if err != nil {
-					log.Printf("Could not read %s: %s.\n", path, err.Error())
-					return
-				}
-				contents = bytes.Replace(contents, []byte("IP"), []byte(ip), -1)
-				contents = bytes.Replace(contents, []byte("PORT"), []byte(strconv.Itoa(port)), -1)
-				err = ioutil.WriteFile(path, contents, 0644)
-				if err != nil {
-					log.Printf("Could not write %s: %s.\n", path, err.Error())
-				}
-			},
-			handlerUID: handlerUIDServer,
-		},
-		dropletFile{
-			name:     fileSpigot,
-			required: true,
-		},
+	address := "127.0.0.1"
+	if config.ExternalIP != "" {
+		address = config.ExternalIP
 	}
-	errDropletDeleted = errors.New("droplet no longer exists")
-)
-
-// isValid checks the validity of a template.
-func (t *Template) isValid() bool {
-	return t.Name != "" && t.MinMemory > 0 && t.MaxMemory > 0 && t.MinMemory <= t.MaxMemory
+	log.Printf("Using outbound IP address %s.\n", address)
+	log.Printf("Using free port %d.\n", port)
+	instance = &droplet{
+		identifier: identifier,
+		iid:        atomic.AddUint64(&iidIncrement, 1),
+		template:   template,
+		identified: false,
+		ip:         address,
+		port:       port,
+		data:       data,
+	}
+	return
 }
 
-// containsFiles checks if the template contains all required files.
-func (t *Template) containsFiles() bool {
-	for i := 0; i < len(requiredFiles); i++ {
-		requiredFile := &requiredFiles[i]
-		path := templatePath(t.Name, requiredFile.name)
-		if !fileExists(path) && requiredFile.required {
-			log.Printf("Missing file %s for template %s.\n", path, t.Name)
-			return false
+// creates the Droplet container.
+func (droplet *droplet) create() error {
+	log.Println("Creating Docker container.")
+	command, arguments := dropletGenerateRun(droplet.template, droplet.identifier)
+	err := ioCommand(command, arguments...)
+	if err != nil {
+		return err
+	}
+	log.Println("Attaching networks.")
+	for _, network := range droplet.template.Networks {
+		err = ioCommand("docker", "network", "connect", network, droplet.identifier)
+		if err != nil {
+			return err
 		}
 	}
-	return true
+	return nil
+}
+
+// runs the Droplet container.
+func (droplet *droplet) run() error {
+	log.Println("Starting container.")
+	return ioCommand("docker", "container", "start", droplet.identifier)
+}
+
+// destroys the Droplet container.
+func (droplet *droplet) destroy(payload bool) error {
+	log.Print("Forcefully removing container.")
+	return ioCommand("docker", "container", "rm", "-f", droplet.identifier)
+}
+
+// toPayloadData converts the Droplet into a PayloadDroplet.
+func (droplet *droplet) toPayloadData() *PayloadDroplet {
+	return &PayloadDroplet{
+		Identifier: droplet.identifier,
+		IP:         droplet.ip,
+		Port:       droplet.port,
+		Data:       droplet.data,
+	}
+}
+
+// get gets a Droplet by identifier.
+func (garage *garage) get(identifier string) *droplet {
+	garage.lock.RLock()
+	defer garage.lock.RUnlock()
+	return garage.droplets[identifier]
+}
+
+// contains checks if a Droplet with a certain identifier exists.
+func (garage *garage) contains(identifier string) bool {
+	garage.lock.RLock()
+	defer garage.lock.RUnlock()
+	_, contains := garage.droplets[identifier]
+	return contains
+}
+
+// put adds a new Droplet to the storage.
+func (garage *garage) put(droplet *droplet) {
+	garage.lock.Lock()
+	defer garage.lock.Unlock()
+	garage.droplets[droplet.identifier] = droplet
+}
+
+// remove removes a Droplet from the storage.
+func (garage *garage) remove(identifier string) {
+	garage.lock.Lock()
+	defer garage.lock.Unlock()
+	delete(garage.droplets, identifier)
+}
+
+// forEach executes a lambda for each registered Droplet.
+func (garage *garage) forEach(lambda func(*droplet)) {
+	for _, droplet := range garage.droplets {
+		lambda(droplet)
+	}
+}
+
+// dropletGenerateRun generates the run command syntax.
+func dropletGenerateRun(template *Template, identifier string) (command string, arguments []string) {
+	command = "docker"
+	arguments = []string{
+		"create",
+		"--name",
+		identifier,
+		"-d",
+	}
+	arguments = append(arguments, strings.Split(template.Flags, " ")...)
+	if template.RestrictCPU > 0 {
+		arguments = append(arguments, fmt.Sprintf("--cpus=%d", template.RestrictCPU))
+	}
+	if template.RestrictRAM != "" {
+		arguments = append(arguments, fmt.Sprintf("--memory=%s", template.RestrictRAM))
+	}
+	for _, mount := range template.Mounts {
+		arguments = append(arguments, "-v", fmt.Sprintf("%s:%s", mount.From, mount.To))
+	}
+	arguments = append(arguments, template.Image)
+	return
+}
+
+// dropletGenerateIdentifier generates an available Droplet identifier.
+func dropletGenerateIdentifier(template string) string {
+	id := 0
+	contains := true
+	for contains {
+		id++
+		contains = store.contains(dropletFormatIdentifier(template, id))
+	}
+	return dropletFormatIdentifier(template, id)
+}
+
+// dropletFormatIdentifier formats a template name and incremental ID to form an identifier.
+func dropletFormatIdentifier(template string, id int) string {
+	return fmt.Sprintf("%s-%d", template, id)
 }
