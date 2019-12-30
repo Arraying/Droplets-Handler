@@ -70,7 +70,7 @@ func (template *Template) construct(data string) (instance *droplet, err error) 
 // creates the Droplet container.
 func (droplet *droplet) create() error {
 	log.Println("Creating Docker container.")
-	command, arguments := dropletGenerateRun(droplet.template, droplet.identifier)
+	command, arguments := dropletGenerateRun(droplet)
 	err := ioCommand(command, arguments...)
 	if err != nil {
 		return err
@@ -144,25 +144,29 @@ func (garage *garage) forEach(lambda func(*droplet)) {
 }
 
 // dropletGenerateRun generates the run command syntax.
-func dropletGenerateRun(template *Template, identifier string) (command string, arguments []string) {
+func dropletGenerateRun(droplet *droplet) (command string, arguments []string) {
 	command = "docker"
 	arguments = []string{
 		"create",
 		"--name",
-		identifier,
+		droplet.identifier,
 		"-d",
+		"-e",
+		"DROPLET_IDENTIFIER=" + droplet.identifier,
+		"DROPLET_IP=" + droplet.ip,
+		"DROPLET_DATA=" + droplet.data,
 	}
-	arguments = append(arguments, strings.Split(template.Flags, " ")...)
-	if template.RestrictCPU > 0 {
-		arguments = append(arguments, fmt.Sprintf("--cpus=%d", template.RestrictCPU))
+	arguments = append(arguments, strings.Split(droplet.template.Flags, " ")...)
+	if droplet.template.RestrictCPU > 0 {
+		arguments = append(arguments, fmt.Sprintf("--cpus=%d", droplet.template.RestrictCPU))
 	}
-	if template.RestrictRAM != "" {
-		arguments = append(arguments, fmt.Sprintf("--memory=%s", template.RestrictRAM))
+	if droplet.template.RestrictRAM != "" {
+		arguments = append(arguments, fmt.Sprintf("--memory=%s", droplet.template.RestrictRAM))
 	}
-	for _, mount := range template.Mounts {
+	for _, mount := range droplet.template.Mounts {
 		arguments = append(arguments, "-v", fmt.Sprintf("%s:%s", mount.From, mount.To))
 	}
-	arguments = append(arguments, template.Image)
+	arguments = append(arguments, droplet.template.Image)
 	return
 }
 
